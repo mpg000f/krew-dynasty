@@ -160,9 +160,9 @@ def build_position_adjustments(ktc_players):
         for rank in range(1, 71):
             pts = curve_pts(pos, rank)
             if pts >= std_repl_pts:
-                extra = std_repl_pts - league_repl_pts      # constant for all clear starters
+                extra = 0                        # starter in both leagues — no adjustment
             elif pts >= league_repl_pts:
-                extra = pts - league_repl_pts                # partial for marginal starters
+                extra = pts - league_repl_pts    # new starter only in this league
             else:
                 extra = 0
             bonuses[rank] = round(k * extra)
