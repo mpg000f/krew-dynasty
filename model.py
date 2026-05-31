@@ -152,12 +152,11 @@ def apply_position_adjustment(players, adjustments):
     """
     for p in players:
         pos  = p.get("position", "")
-        rank = p.get("ktc_rank")
+        rank = p.get("pos_rank")  # positional rank within KTC, not overall rank
         if pos not in adjustments or rank is None or p.get("is_pick"):
             p["adj_value"] = p["value"]
             p["adj_factor"] = 1.0
             continue
-        # KTC positional rank beyond our curve → use the last factor
         max_rank = max(adjustments[pos].keys())
         r = min(int(rank), max_rank)
         f = adjustments[pos].get(r, 1.0)
@@ -207,6 +206,7 @@ def fetch_ktc():
             try:
                 players_raw = json.loads(m.group(1))
                 result = parse_ktc_players(players_raw)
+                result = add_positional_ranks(result)
                 print(f"  Loaded {len(result)} players from KTC (native TEP+SF values).")
                 return result
             except Exception as e:
@@ -252,6 +252,24 @@ def parse_ktc_players(raw):
             "source":    "KTC",
         })
     return out
+
+
+def add_positional_ranks(players):
+    """
+    Assign pos_rank (rank within position by KTC value) to each player.
+    This is distinct from ktc_rank (overall dynasty rank) and is what the
+    VORP adjustment factors are indexed by.
+    """
+    by_pos = {}
+    for i, p in enumerate(players):
+        pos = p.get("position", "")
+        if pos in POSITIONS:
+            by_pos.setdefault(pos, []).append(i)
+    for pos, indices in by_pos.items():
+        sorted_idx = sorted(indices, key=lambda i: -players[i]["value"])
+        for rank, idx in enumerate(sorted_idx, 1):
+            players[idx]["pos_rank"] = rank
+    return players
 
 
 def fetch_fantasycalc():
@@ -681,7 +699,28 @@ def get_rookie_list(players, roster_to_owner):
     return result
 
 
-def render_html(team_totals, rookies, pick_board, roster_to_owner, updated_at):
+def get_all_players_data(players, roster_to_owner):
+    result = []
+    for p in players:
+        if p.get("is_pick"):
+            continue
+        rid   = p.get("on_roster_id")
+        owner = roster_to_owner.get(rid, "") if rid else ""
+        result.append({
+            "name":   p["name"],
+            "pos":    p.get("position", ""),
+            "team":   p.get("team", "FA"),
+            "age":    p.get("age"),
+            "adj":    p.get("adj_value", p["value"]),
+            "raw":    p["value"],
+            "factor": p.get("adj_factor", 1.0),
+            "owner":  owner,
+        })
+    result.sort(key=lambda x: -x["adj"])
+    return result
+
+
+def render_html(team_totals, rookies, all_players_data, pick_board, roster_to_owner, updated_at):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     def fmt(n):
@@ -785,6 +824,24 @@ def render_html(team_totals, rookies, pick_board, roster_to_owner, updated_at):
             f'<td class="text-secondary">{orig}</td></tr>\n'
         )
 
+    # ── All players rows ────────────────────────────────────────────────────
+    all_player_rows = ""
+    for rk, p in enumerate(all_players_data, 1):
+        age_s  = f'{p["age"]:.1f}' if p.get("age") and p["age"] > 0 else "?"
+        mult   = f'{p["factor"]:.2f}x' if p["raw"] else "—"
+        owner  = p["owner"] or '<span class="text-secondary">—</span>'
+        is_me  = p["owner"] == MY_TEAM
+        row_cls = ' class="you-row"' if is_me else ""
+        all_player_rows += (
+            f'<tr data-pos="{p["pos"]}"{row_cls}>'
+            f'<td>{rk}</td><td>{p["name"]}</td><td>{p["pos"]}</td>'
+            f'<td>{p["team"]}</td><td>{age_s}</td>'
+            f'<td class="text-end">{fmt(p["adj"])}</td>'
+            f'<td class="text-end">{fmt(p["raw"])}</td>'
+            f'<td class="text-end text-secondary">{mult}</td>'
+            f'<td>{owner}</td></tr>\n'
+        )
+
     html = f"""<!DOCTYPE html>
 <html lang="en" data-bs-theme="dark">
 <head>
@@ -813,6 +870,7 @@ def render_html(team_totals, rookies, pick_board, roster_to_owner, updated_at):
 <div class="container-xl px-3">
   <ul class="nav nav-tabs mb-4" id="tabs">
     <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-rankings" type="button">Power Rankings</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-all-players" type="button">All Players</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-rookies" type="button">Rookie Board</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-picks" type="button">2026 Pick Ownership</button></li>
   </ul>
@@ -831,6 +889,25 @@ def render_html(team_totals, rookies, pick_board, roster_to_owner, updated_at):
       </div>
       <h6 class="mb-3">Roster Detail</h6>
       <div class="accordion">{accordion_items}</div>
+    </div>
+
+    <div class="tab-pane fade" id="tab-all-players">
+      <p class="text-secondary small mb-2">All players ranked by league-adjusted value. <em>Adj</em> = KTC &times; positional multiplier based on 3RB/4WR/2FLEX roster construction.</p>
+      <div class="btn-group btn-group-sm mb-3" role="group">
+        <button type="button" class="btn btn-outline-secondary active pos-filter" onclick="filterPos(this,'ALL')">All</button>
+        <button type="button" class="btn btn-outline-secondary pos-filter" onclick="filterPos(this,'QB')">QB</button>
+        <button type="button" class="btn btn-outline-secondary pos-filter" onclick="filterPos(this,'RB')">RB</button>
+        <button type="button" class="btn btn-outline-secondary pos-filter" onclick="filterPos(this,'WR')">WR</button>
+        <button type="button" class="btn btn-outline-secondary pos-filter" onclick="filterPos(this,'TE')">TE</button>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle" id="players-table">
+          <thead class="table-secondary text-dark">
+            <tr><th>Rk</th><th>Name</th><th>Pos</th><th>NFL Team</th><th>Age</th><th class="text-end">Adj</th><th class="text-end">KTC</th><th class="text-end">Mult</th><th>Owner</th></tr>
+          </thead>
+          <tbody>{all_player_rows}</tbody>
+        </table>
+      </div>
     </div>
 
     <div class="tab-pane fade" id="tab-rookies">
@@ -865,6 +942,16 @@ def render_html(team_totals, rookies, pick_board, roster_to_owner, updated_at):
 </footer>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+function filterPos(btn, pos) {{
+  document.querySelectorAll('#players-table tbody tr').forEach(function(tr) {{
+    tr.style.display = (pos === 'ALL' || tr.dataset.pos === pos) ? '' : 'none';
+  }});
+  document.querySelectorAll('.pos-filter').forEach(function(b) {{
+    b.classList.toggle('active', b === btn);
+  }});
+}}
+</script>
 </body>
 </html>"""
 
@@ -881,6 +968,7 @@ def main():
     source  = ktc_raw[0].get("source", "KTC") if ktc_raw else "KTC"
     if source == "FC":
         ktc_raw = apply_tep(ktc_raw)
+        ktc_raw = add_positional_ranks(ktc_raw)
 
     # 2. Positional adjustment from 5 seasons of historical scoring
     adjustments, _ = build_position_adjustments()
@@ -911,10 +999,11 @@ def main():
     print()
 
     # 8. HTML output → docs/index.html
-    updated_at = datetime.now(timezone.utc).strftime("%B %d, %Y at %H:%M UTC")
-    team_totals  = compute_team_totals(rosters, all_players, players, roster_to_owner, team_picks)
-    rookie_data  = get_rookie_list(players, roster_to_owner)
-    render_html(team_totals, rookie_data, pick_board, roster_to_owner, updated_at)
+    updated_at       = datetime.now(timezone.utc).strftime("%B %d, %Y at %H:%M UTC")
+    team_totals      = compute_team_totals(rosters, all_players, players, roster_to_owner, team_picks)
+    rookie_data      = get_rookie_list(players, roster_to_owner)
+    all_players_data = get_all_players_data(players, roster_to_owner)
+    render_html(team_totals, rookie_data, all_players_data, pick_board, roster_to_owner, updated_at)
     print()
 
 
