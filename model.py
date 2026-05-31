@@ -13,6 +13,9 @@ import sys
 import json
 import re
 import requests
+import pandas as pd
+import numpy as np
+import nfl_data_py as nfl
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
@@ -22,21 +25,18 @@ DRAFT_ID   = "1312078949873885184"
 SEASON     = "2026"
 POSITIONS  = {"QB", "RB", "WR", "TE"}
 
-KTC_FORMAT = 2    # 2 = Superflex
-TEP_BONUS  = 0.25  # TEs get 0.5 + 0.25 = 0.75 PPR; already baked into KTC tep values
+KTC_FORMAT = 2
+TEP_BONUS  = 0.25  # TEs: 0.5 base + 0.25 TEP = 0.75 PPR; already in KTC tep values
 
 SLEEPER = "https://api.sleeper.app/v1"
 
-# ── Positional scalars ────────────────────────────────────────────────────────
-# KTC SF+TEP values are calibrated to a standard SF league.
-# This league starts more RBs and WRs per team, making those positions scarcer.
-# Scalar = this league's starters / standard SF starters (10-team basis).
-#
-#   QB:  10 teams × 2 QB/SF  = 20  vs standard 20  → 1.00x (no change)
-#   RB:  10 × (3 RB + 2 FLEX×60%) = 42  vs standard 10 × (2 RB + 1 FLEX×50%) = 25  → 1.40x
-#   WR:  10 × (4 WR + 2 FLEX×40%) = 48  vs standard 10 × (2 WR + 1 FLEX×50%) = 25  → 1.60x
-#   TE:  10 × 1 TE = 10  vs standard 10  → 1.00x (TEP value already in KTC base)
-POSITION_SCALARS = {"QB": 1.00, "RB": 1.40, "WR": 1.60, "TE": 1.00}
+# Starters per position across all 10 teams.
+# Standard 10-team 2QB/SF: 1QB+1SF=2QB, 2RB+½FLEX=25RB, 2WR+½FLEX=25WR, 1TE=10TE
+# This league:              2QB=20QB,    3RB+~1.2FLEX=42RB, 4WR+~0.8FLEX=48WR, 1TE=10TE
+STANDARD_STARTERS = {"QB": 20, "RB": 25, "WR": 25, "TE": 10}
+LEAGUE_STARTERS   = {"QB": 20, "RB": 42, "WR": 48, "TE": 10}
+
+STAT_YEARS = list(range(2020, 2025))
 
 MY_TEAM    = "pltiii"
 OUTPUT_DIR = "docs"
@@ -53,13 +53,140 @@ def normalize(name):
     return re.sub(r"[^a-z ]", "", name.lower()).strip()
 
 
-# ── Positional Adjustment ─────────────────────────────────────────────────────
-def apply_position_adjustment(players):
-    """Scale each player's KTC value by the league's positional scalar."""
+# ── Positional Adjustment (additive VORP) ────────────────────────────────────
+def _league_pts(row):
+    """Fantasy points under this league's exact scoring settings."""
+    pos = row["position"]
+    p  = row.get("passing_yards", 0)            * 0.04
+    p += row.get("passing_tds", 0)              * 4
+    p += row.get("interceptions", 0)            * -1
+    p += row.get("passing_2pt_conversions", 0)  * 2
+    p += row.get("rushing_yards", 0)            * 0.1
+    p += row.get("rushing_tds", 0)              * 6
+    p += row.get("rushing_2pt_conversions", 0)  * 2
+    rec_bonus = TEP_BONUS if pos == "TE" else 0
+    p += row.get("receptions", 0)               * (0.5 + rec_bonus)
+    p += row.get("receiving_yards", 0)          * 0.1
+    p += row.get("receiving_tds", 0)            * 6
+    p += row.get("receiving_2pt_conversions", 0)* 2
+    p += (row.get("sack_fumbles_lost", 0) +
+          row.get("rushing_fumbles_lost", 0) +
+          row.get("receiving_fumbles_lost", 0)) * -2
+    return p
+
+
+def build_position_adjustments(ktc_players):
+    """
+    Compute an additive KTC bonus for each positional rank based on how much
+    deeper this league's starter pool is vs standard SF.
+
+    Concept
+    -------
+    KTC calibrates values relative to a standard replacement level (e.g. WR25
+    in a 10-team 2QB league).  Your league needs 48 WR starters, so WR25–WR48
+    are genuine starters here but worthless in standard.
+
+    Adjustment (additive, not multiplicative)
+    -----------------------------------------
+    For a player above BOTH replacement levels (rank ≤ standard_repl_rank):
+        bonus = (pts[std_repl] - pts[league_repl]) × k
+        → same absolute KTC bonus for every starter — small % for elite, larger % for mid-tier
+
+    For a player in the "new starter" zone (standard_repl < rank ≤ league_repl):
+        bonus = (pts[rank] - pts[league_repl]) × k
+        → proportional to how far above your replacement level they sit
+
+    For players below league replacement: bonus = 0
+
+    k (KTC per fantasy point) is derived position-by-position from the slope
+    of live KTC values vs the historical scoring curve.
+    """
+    print("Loading historical stats for positional adjustment (2020–2024)…")
+    players_df = nfl.import_players()[["gsis_id", "display_name", "position"]].rename(
+        columns={"gsis_id": "player_id", "display_name": "player_name"})
+    stats_df = nfl.import_seasonal_data(STAT_YEARS, s_type="REG")
+    df = stats_df.merge(players_df, on="player_id", how="left")
+    df = df[df["position"].isin(POSITIONS) & (df["games"] >= 4)].copy()
+    df["fpts"] = df.apply(_league_pts, axis=1)
+
+    records = []
+    for season, grp in df.groupby("season"):
+        for pos, pgrp in grp.groupby("position"):
+            ranked = pgrp.sort_values("fpts", ascending=False).reset_index(drop=True)
+            ranked["pos_rank"] = range(1, len(ranked) + 1)
+            records.append(ranked[["pos_rank", "position", "fpts"]])
+    curve = (pd.concat(records)
+               .groupby(["position", "pos_rank"])["fpts"]
+               .mean()
+               .reset_index()
+               .rename(columns={"fpts": "avg_fpts"}))
+
+    def curve_pts(pos, rank):
+        sub = curve[(curve.position == pos) & (curve.pos_rank == rank)]
+        if sub.empty:
+            sub = curve[curve.position == pos]
+            sub = sub.iloc[(sub["pos_rank"] - rank).abs().argsort()].head(1)
+        return float(sub["avg_fpts"].values[0])
+
+    # KTC value at each positional rank (from live data)
+    ktc_val = {}
+    for p in ktc_players:
+        pos  = p.get("position", "")
+        rank = p.get("pos_rank")
+        if pos in POSITIONS and rank:
+            ktc_val.setdefault(pos, {})[rank] = p["value"]
+
+    adjustments = {}
+    for pos in POSITIONS:
+        std_repl_rank    = STANDARD_STARTERS[pos]
+        league_repl_rank = LEAGUE_STARTERS[pos]
+        std_repl_pts     = curve_pts(pos, std_repl_rank)
+        league_repl_pts  = curve_pts(pos, league_repl_rank)
+
+        # Estimate k: KTC per fantasy point, using ranks 3 and 15 as anchors.
+        # Ranks well inside the starter zone give a stable slope estimate.
+        hi_rank = min(3,  max(ktc_val.get(pos, {}).keys(), default=3))
+        lo_rank = min(15, max(ktc_val.get(pos, {}).keys(), default=15))
+        ktc_hi  = ktc_val.get(pos, {}).get(hi_rank)
+        ktc_lo  = ktc_val.get(pos, {}).get(lo_rank)
+        if ktc_hi and ktc_lo:
+            pts_diff = curve_pts(pos, hi_rank) - curve_pts(pos, lo_rank)
+            k = (ktc_hi - ktc_lo) / pts_diff if pts_diff > 0 else 35.0
+        else:
+            k = 35.0
+
+        # Bonus for each positional rank
+        bonuses = {}
+        for rank in range(1, 71):
+            pts = curve_pts(pos, rank)
+            if pts >= std_repl_pts:
+                extra = std_repl_pts - league_repl_pts      # constant for all clear starters
+            elif pts >= league_repl_pts:
+                extra = pts - league_repl_pts                # partial for marginal starters
+            else:
+                extra = 0
+            bonuses[rank] = round(k * extra)
+
+        adjustments[pos] = bonuses
+        print(f"  {pos}: std_repl={std_repl_pts:.0f}pts, league_repl={league_repl_pts:.0f}pts, "
+              f"k={k:.1f}, bonus@rank1={bonuses[1]}, bonus@std_repl={bonuses[std_repl_rank]}")
+
+    return adjustments
+
+
+def apply_position_adjustment(players, adjustments):
+    """Add the positional bonus (in KTC units) to each player's raw KTC value."""
     for p in players:
-        f = POSITION_SCALARS.get(p.get("position", ""), 1.0) if not p.get("is_pick") else 1.0
-        p["adj_value"]  = round(p["value"] * f)
-        p["adj_factor"] = f
+        pos  = p.get("position", "")
+        rank = p.get("pos_rank")
+        if pos not in adjustments or rank is None or p.get("is_pick"):
+            p["adj_value"]  = p["value"]
+            p["adj_factor"] = 1.0
+            continue
+        max_rank = max(adjustments[pos].keys())
+        bonus = adjustments[pos].get(min(int(rank), max_rank), 0)
+        p["adj_value"]  = p["value"] + bonus
+        p["adj_factor"] = round(p["adj_value"] / p["value"], 3) if p["value"] else 1.0
     return players
 
 
@@ -868,17 +995,20 @@ def main():
         ktc_raw = apply_tep(ktc_raw)
         ktc_raw = add_positional_ranks(ktc_raw)
 
-    # 2. Sleeper
+    # 2. Positional adjustment: additive VORP bonus from historical scoring data
+    adjustments = build_position_adjustments(ktc_raw)
+
+    # 3. Sleeper
     users, rosters, traded_picks, draft_info, all_players = fetch_sleeper()
 
-    # 3. Maps
+    # 4. Maps
     roster_to_owner, player_on_roster = build_maps(users, rosters)
 
-    # 4. Match KTC → Sleeper, then apply league-specific positional scalars
+    # 5. Match KTC → Sleeper, apply additive positional adjustment
     players = match_players(ktc_raw, all_players, player_on_roster)
-    players = apply_position_adjustment(players)
+    players = apply_position_adjustment(players, adjustments)
 
-    # 5. Pick boards
+    # 6. Pick boards
     pick_board     = build_pick_board(draft_info, traded_picks)
     pick_value_map = build_pick_value_map(ktc_raw)
     team_picks     = build_team_picks(draft_info, traded_picks, pick_value_map)
