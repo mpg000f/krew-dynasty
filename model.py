@@ -6,18 +6,15 @@ Pulls live data from Sleeper + KeepTradeCut and outputs:
   3. 2026 rookie draft board
   4. 2026 pick ownership board
 
-Values: KTC (raw) + positional scarcity adjustment for 3RB/4WR/2FLEX vs standard SF.
+Values: KTC SF+TEP with a modest flat multiplier on RB/WR to reflect deeper
+roster requirements (3RB/4WR/2FLEX) vs a standard SF league.
 Scoring: 2QB/SUPERFLEX | 0.5 PPR | 0.25 TEP
 """
 
 import os
-import io
 import json
 import re
 import requests
-import pandas as pd
-import numpy as np
-import nfl_data_py as nfl
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
@@ -32,13 +29,9 @@ TEP_BONUS  = 0.25
 
 SLEEPER = "https://api.sleeper.app/v1"
 
-# Starters per position across all 10 teams.
-# Standard 10-team 2QB/SF: 2QB, 25RB, 25WR, 10TE
-# This league:              2QB, 42RB, 48WR, 10TE
-STANDARD_STARTERS = {"QB": 20, "RB": 25, "WR": 25, "TE": 10}
-LEAGUE_STARTERS   = {"QB": 20, "RB": 42, "WR": 48, "TE": 10}
-
-STAT_YEARS = list(range(2021, 2026))   # 2025 fetched from nflverse stats_player release
+# Modest flat multiplier on RB/WR to reflect deeper roster requirements
+# (3RB/4WR/2FLEX with 10 teams) vs the standard SF league KTC calibrates for.
+POS_MULTIPLIER = {"QB": 1.0, "RB": 1.06, "WR": 1.08, "TE": 1.0}
 
 MY_TEAM    = "pltiii"
 OUTPUT_DIR = "docs"
@@ -55,151 +48,15 @@ def normalize(name):
     return re.sub(r"[^a-z ]", "", name.lower()).strip()
 
 
-# ── Fantasy Scoring ───────────────────────────────────────────────────────────
-def _league_pts(row):
-    """Fantasy points under this league's exact scoring settings."""
-    pos = row["position"]
-    p  = row.get("passing_yards", 0)            * 0.04
-    p += row.get("passing_tds", 0)              * 4
-    p += row.get("interceptions", 0)            * -1
-    p += row.get("passing_2pt_conversions", 0)  * 2
-    p += row.get("rushing_yards", 0)            * 0.1
-    p += row.get("rushing_tds", 0)              * 6
-    p += row.get("rushing_2pt_conversions", 0)  * 2
-    rec_bonus = TEP_BONUS if pos == "TE" else 0
-    p += row.get("receptions", 0)               * (0.5 + rec_bonus)
-    p += row.get("receiving_yards", 0)          * 0.1
-    p += row.get("receiving_tds", 0)            * 6
-    p += row.get("receiving_2pt_conversions", 0)* 2
-    p += (row.get("sack_fumbles_lost", 0) +
-          row.get("rushing_fumbles_lost", 0) +
-          row.get("receiving_fumbles_lost", 0)) * -2
-    return p
-
-
-# ── Stats Pipeline (for positional adjustment only) ───────────────────────────
-_NFLVERSE_STATS_URL = (
-    "https://github.com/nflverse/nflverse-data/releases/download"
-    "/stats_player/stats_player_reg_{year}.parquet"
-)
-
-def load_stats_data():
-    """
-    Load seasonal stats from nflverse stats_player release (2021–2025).
-    Used only to build the historical scoring curve for positional adjustment.
-    """
-    frames = []
-    for yr in STAT_YEARS:
-        url = _NFLVERSE_STATS_URL.format(year=yr)
-        try:
-            r = requests.get(url, timeout=30)
-            r.raise_for_status()
-            frames.append(pd.read_parquet(io.BytesIO(r.content)))
-        except Exception:
-            pass
-
-    if not frames:
-        raise RuntimeError("No seasonal stats available from nflverse for any year in STAT_YEARS.")
-
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop(columns=["player_name"], errors="ignore")
-    df = df.rename(columns={
-        "player_display_name": "player_name",
-        "passing_interceptions": "interceptions",
-    })
-
-    loaded = sorted(df["season"].dropna().astype(int).unique())
-    print(f"  Loaded stats {loaded[0]}–{loaded[-1]}.")
-
-    df = df[df["position"].isin(POSITIONS) & (df["games"] >= 4)].copy()
-    df["fpts"]    = df.apply(_league_pts, axis=1)
-    df["fpts_17"] = df["fpts"] / df["games"] * 17
-    return df
-
-
-def build_scoring_curve(df):
-    """Returns curve_pts(pos, rank): avg fantasy points at each positional rank."""
-    records = []
-    for _, grp in df.groupby("season"):
-        for pos, pgrp in grp.groupby("position"):
-            ranked = pgrp.sort_values("fpts_17", ascending=False).reset_index(drop=True)
-            ranked["pos_rank"] = range(1, len(ranked) + 1)
-            records.append(ranked[["pos_rank", "position", "fpts_17"]])
-
-    curve_df = (pd.concat(records)
-                  .groupby(["position", "pos_rank"])["fpts_17"]
-                  .mean()
-                  .reset_index()
-                  .rename(columns={"fpts_17": "avg_fpts"}))
-
-    def curve_pts(pos, rank):
-        sub = curve_df[(curve_df.position == pos) & (curve_df.pos_rank == rank)]
-        if sub.empty:
-            sub = curve_df[curve_df.position == pos]
-            sub = sub.iloc[(sub["pos_rank"] - rank).abs().argsort()].head(1)
-        return float(sub["avg_fpts"].values[0]) if not sub.empty else 0.0
-
-    return curve_pts
-
-
-# ── Positional Adjustment (additive VORP) ────────────────────────────────────
-def build_position_adjustments(ktc_players, curve_pts):
-    """
-    Additive KTC bonus for each positional rank based on league vs standard starter depth.
-
-    Players in the "new starter zone" (standard_repl < rank ≤ league_repl) get a bonus
-    proportional to how far above league replacement level they sit. Clear starters and
-    below-replacement players get no bonus.
-    """
-    ktc_val = {}
-    for p in ktc_players:
-        pos  = p.get("position", "")
-        rank = p.get("pos_rank")
-        if pos in POSITIONS and rank:
-            ktc_val.setdefault(pos, {})[rank] = p["value"]
-
-    adjustments = {}
-    for pos in POSITIONS:
-        std_repl_rank    = STANDARD_STARTERS[pos]
-        league_repl_rank = LEAGUE_STARTERS[pos]
-        std_repl_pts     = curve_pts(pos, std_repl_rank)
-        league_repl_pts  = curve_pts(pos, league_repl_rank)
-
-        # k = KTC per fantasy point, estimated from ranks 3–15
-        hi_rank = min(3,  max(ktc_val.get(pos, {}).keys(), default=3))
-        lo_rank = min(15, max(ktc_val.get(pos, {}).keys(), default=15))
-        ktc_hi  = ktc_val.get(pos, {}).get(hi_rank)
-        ktc_lo  = ktc_val.get(pos, {}).get(lo_rank)
-        if ktc_hi and ktc_lo:
-            pts_diff = curve_pts(pos, hi_rank) - curve_pts(pos, lo_rank)
-            k = (ktc_hi - ktc_lo) / pts_diff if pts_diff > 0 else 35.0
-        else:
-            k = 35.0
-
-        bonuses = {}
-        for rank in range(1, 71):
-            pts = curve_pts(pos, rank)
-            extra = max(0, pts - league_repl_pts) if pts < std_repl_pts else 0
-            bonuses[rank] = round(k * extra)
-
-        adjustments[pos] = bonuses
-        print(f"  {pos}: std_repl={std_repl_pts:.0f}pts  league_repl={league_repl_pts:.0f}pts  "
-              f"k={k:.1f}  bonus@rank1={bonuses[1]}  bonus@std_repl={bonuses[std_repl_rank]}")
-
-    return adjustments
-
-
-def apply_position_adjustment(players, adjustments):
-    """Add positional scarcity bonus to KTC value → adj_value."""
+# ── Positional Adjustment (flat multiplier) ───────────────────────────────────
+def apply_position_adjustment(players):
+    """Apply flat POS_MULTIPLIER to RB/WR; all other positions stay at 1.0x."""
     for p in players:
-        pos  = p.get("position", "")
-        rank = p.get("pos_rank")
-        if pos not in adjustments or rank is None or p.get("is_pick"):
+        if p.get("is_pick"):
             p["adj_value"] = p["value"]
             continue
-        max_rank       = max(adjustments[pos].keys())
-        bonus          = adjustments[pos].get(min(int(rank), max_rank), 0)
-        p["adj_value"] = p["value"] + bonus
+        mult = POS_MULTIPLIER.get(p.get("position", ""), 1.0)
+        p["adj_value"] = round(p["value"] * mult)
     return players
 
 
@@ -486,7 +343,7 @@ def print_roster_overview(rosters, all_players, players_matched, roster_to_owner
     team_totals.sort(key=lambda x: -x[5])
 
     divider("DYNASTY POWER RANKINGS  (league-adjusted KTC SF+TEP)")
-    print("  Values adjusted for 3RB/4WR/2FLEX roster vs standard SF baseline.")
+    print("  RB 1.06x · WR 1.08x flat multiplier vs standard SF baseline.")
     print(f"  {'RK':<4} {'TEAM':<28} {'PLAYERS':>9} {'26 PICKS':>9} {'FUT PICKS':>10} {'TOTAL':>8}")
     divider()
     for rk, (rid, owner, pv, p26, pf, tot) in enumerate(team_totals, 1):
@@ -798,7 +655,7 @@ def render_html(team_totals, rookies, all_players_data, pick_board, roster_to_ow
   <div class="tab-content">
 
     <div class="tab-pane fade show active" id="tab-rankings">
-      <p class="text-secondary small mb-3">Values adjusted for 3RB/4WR/2FLEX roster construction vs standard SF baseline, using 2021&ndash;2025 historical scoring data.</p>
+      <p class="text-secondary small mb-3">Values are KTC SF+TEP with a modest flat multiplier on RB (1.06&times;) and WR (1.08&times;) to reflect deeper roster requirements vs a standard SF league.</p>
       <div class="table-responsive mb-4">
         <table class="table table-sm table-hover align-middle">
           <thead class="table-secondary text-dark">
@@ -812,7 +669,7 @@ def render_html(team_totals, rookies, all_players_data, pick_board, roster_to_ow
     </div>
 
     <div class="tab-pane fade" id="tab-all-players">
-      <p class="text-secondary small mb-2">All players sorted by league-adjusted value. <em>Adj</em> = KTC + positional scarcity bonus for 3RB/4WR/2FLEX. <em>Mult</em> = Adj&divide;KTC.</p>
+      <p class="text-secondary small mb-2">All players sorted by league-adjusted value. <em>Adj</em> = KTC &times; positional multiplier (RB 1.06&times;, WR 1.08&times;). <em>Mult</em> = Adj&divide;KTC.</p>
       <div class="btn-group btn-group-sm mb-3" role="group">
         <button type="button" class="btn btn-outline-secondary active pos-filter" onclick="filterPos(this,'ALL')">All</button>
         <button type="button" class="btn btn-outline-secondary pos-filter" onclick="filterPos(this,'QB')">QB</button>
@@ -858,7 +715,7 @@ def render_html(team_totals, rookies, all_players_data, pick_board, roster_to_ow
 </div>
 
 <footer class="text-center text-secondary small py-4 mt-5">
-  Data: KeepTradeCut + Sleeper API &nbsp;&middot;&nbsp; Positional adjustment: nflverse 2021&ndash;2025
+  Data: KeepTradeCut + Sleeper API &nbsp;&middot;&nbsp; RB 1.06&times; &middot; WR 1.08&times; positional multiplier
 </footer>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -890,19 +747,13 @@ def main():
         ktc_raw = apply_tep(ktc_raw)
         ktc_raw = add_positional_ranks(ktc_raw)
 
-    # 2. Historical scoring curve for positional adjustment
-    print("Building positional adjustments…")
-    df        = load_stats_data()
-    curve_pts = build_scoring_curve(df)
-    adjustments = build_position_adjustments(ktc_raw, curve_pts)
-
-    # 3. Sleeper
+    # 2. Sleeper
     users, rosters, traded_picks, draft_info, all_players = fetch_sleeper()
     roster_to_owner, player_on_roster = build_maps(users, rosters)
 
-    # 4. Match and adjust
+    # 3. Match and adjust
     players = match_players(ktc_raw, all_players, player_on_roster)
-    players = apply_position_adjustment(players, adjustments)
+    players = apply_position_adjustment(players)
 
     # 5. Pick boards
     pick_board     = build_pick_board(draft_info, traded_picks)
